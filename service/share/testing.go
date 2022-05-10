@@ -2,7 +2,6 @@ package share
 
 import (
 	"context"
-	"math"
 	"testing"
 
 	"github.com/ipfs/go-bitswap"
@@ -15,16 +14,13 @@ import (
 	format "github.com/ipfs/go-ipld-format"
 	"github.com/ipfs/go-merkledag"
 	mdutils "github.com/ipfs/go-merkledag/test"
+	"github.com/libp2p/go-libp2p-core/host"
+	"github.com/libp2p/go-libp2p-core/peer"
 	record "github.com/libp2p/go-libp2p-record"
 	mocknet "github.com/libp2p/go-libp2p/p2p/net/mock"
 	"github.com/stretchr/testify/require"
+	"github.com/tendermint/tendermint/pkg/da"
 
-	"github.com/tendermint/tendermint/pkg/wrapper"
-
-	"github.com/celestiaorg/nmt"
-	"github.com/celestiaorg/rsmt2d"
-
-	"github.com/celestiaorg/celestia-node/header"
 	"github.com/celestiaorg/celestia-node/ipld"
 )
 
@@ -55,18 +51,9 @@ func RandFillDAG(t *testing.T, n int, dag format.DAGService) *Root {
 }
 
 func FillDag(t *testing.T, dag format.DAGService, shares []Share) *Root {
-	na := ipld.NewNmtNodeAdder(context.TODO(), dag)
-
-	squareSize := uint32(math.Sqrt(float64(len(shares))))
-	tree := wrapper.NewErasuredNamespacedMerkleTree(uint64(squareSize), nmt.NodeVisitor(na.Visit))
-	eds, err := rsmt2d.ComputeExtendedDataSquare(shares, rsmt2d.NewRSGF8Codec(), tree.Constructor)
+	eds, err := ipld.AddShares(context.TODO(), shares, dag)
 	require.NoError(t, err)
-
-	err = na.Commit()
-	require.NoError(t, err)
-
-	dah, err := header.DataAvailabilityHeaderFromExtendedData(eds)
-	require.NoError(t, err)
+	dah := da.NewDataAvailabilityHeader(eds)
 	return &dah
 }
 
@@ -75,55 +62,124 @@ func RandShares(t *testing.T, n int) []Share {
 	return ipld.RandShares(t, n)
 }
 
-type DAGNet struct {
-	ctx context.Context
-	t   *testing.T
-	net mocknet.Mocknet
+type node struct {
+	*Service
+	format.DAGService
+	host.Host
 }
 
-func NewDAGNet(ctx context.Context, t *testing.T) *DAGNet {
-	return &DAGNet{
+type dagNet struct {
+	ctx   context.Context
+	t     *testing.T
+	net   mocknet.Mocknet
+	nodes []*node
+}
+
+func NewTestDAGNet(ctx context.Context, t *testing.T) *dagNet { //nolint:revive
+	return &dagNet{
 		ctx: ctx,
 		t:   t,
 		net: mocknet.New(ctx),
 	}
 }
 
-func (dn *DAGNet) RandLightService(n int) (*Service, *Root) {
-	dag, root := dn.RandDAG(n)
-	return NewService(dag, NewLightAvailability(dag)), root
+func (dn *dagNet) RandLightNode(n int) (*node, *Root) {
+	nd := dn.LightNode()
+	return nd, RandFillDAG(dn.t, n, nd.DAGService)
 }
 
-func (dn *DAGNet) RandFullService(n int) (*Service, *Root) {
-	dag, root := dn.RandDAG(n)
-	return NewService(dag, NewFullAvailability(dag)), root
+func (dn *dagNet) RandFullNode(n int) (*node, *Root) {
+	nd := dn.FullNode()
+	return nd, RandFillDAG(dn.t, n, nd.DAGService)
 }
 
-func (dn *DAGNet) RandDAG(n int) (format.DAGService, *Root) {
-	dag := dn.CleanDAG()
-	return dag, RandFillDAG(dn.t, n, dag)
+func (dn *dagNet) LightNode() *node {
+	nd := dn.Node()
+	nd.Service = NewService(nd.DAGService, NewLightAvailability(nd.DAGService))
+	return nd
 }
 
-func (dn *DAGNet) CleanService() *Service {
-	dag := dn.CleanDAG()
-	return NewService(dag, NewLightAvailability(dag))
+func (dn *dagNet) FullNode() *node {
+	nd := dn.Node()
+	nd.Service = NewService(nd.DAGService, NewFullAvailability(nd.DAGService))
+	return nd
 }
 
-func (dn *DAGNet) CleanDAG() format.DAGService {
-	nd, err := dn.net.GenPeer()
+func (dn *dagNet) Node() *node {
+	hst, err := dn.net.GenPeer()
 	require.NoError(dn.t, err)
-
 	dstore := dssync.MutexWrap(ds.NewMapDatastore())
 	bstore := blockstore.NewBlockstore(dstore)
 	routing := offline.NewOfflineRouter(dstore, record.NamespacedValidator{})
-	bs := bitswap.New(dn.ctx, network.NewFromIpfsHost(nd, routing), bstore, bitswap.ProvideEnabled(false))
-	return merkledag.NewDAGService(blockservice.New(bstore, bs))
+	bs := bitswap.New(
+		dn.ctx,
+		network.NewFromIpfsHost(hst, routing),
+		bstore,
+		bitswap.ProvideEnabled(false),          // disable routines for DHT content provides, as we don't use them
+		bitswap.EngineBlockstoreWorkerCount(1), // otherwise it spawns 128 routines which is too much for tests
+		bitswap.EngineTaskWorkerCount(2),
+		bitswap.TaskWorkerCount(2),
+	)
+	nd := &node{DAGService: merkledag.NewDAGService(blockservice.New(bstore, bs)), Host: hst}
+	dn.nodes = append(dn.nodes, nd)
+	return nd
 }
 
-func (dn *DAGNet) ConnectAll() {
+func (dn *dagNet) ConnectAll() {
 	err := dn.net.LinkAll()
 	require.NoError(dn.t, err)
 
 	err = dn.net.ConnectAllButSelf()
 	require.NoError(dn.t, err)
+}
+
+func (dn *dagNet) Connect(peerA, peerB peer.ID) {
+	_, err := dn.net.LinkPeers(peerA, peerB)
+	require.NoError(dn.t, err)
+	_, err = dn.net.ConnectPeers(peerA, peerB)
+	require.NoError(dn.t, err)
+}
+
+func (dn *dagNet) Disconnect(peerA, peerB peer.ID) {
+	err := dn.net.DisconnectPeers(peerA, peerB)
+	require.NoError(dn.t, err)
+	err = dn.net.UnlinkPeers(peerA, peerB)
+	require.NoError(dn.t, err)
+}
+
+type subNet struct {
+	*dagNet
+	nodes []*node
+}
+
+func (dn *dagNet) SubNet() *subNet {
+	return &subNet{dn, nil}
+}
+
+func (sn *subNet) LightNode() *node {
+	nd := sn.dagNet.LightNode()
+	sn.nodes = append(sn.nodes, nd)
+	return nd
+}
+
+func (sn *subNet) FullNode() *node {
+	nd := sn.dagNet.FullNode()
+	sn.nodes = append(sn.nodes, nd)
+	return nd
+}
+
+func (sn *subNet) ConnectAll() {
+	nodes := sn.nodes
+	for _, n1 := range nodes {
+		for _, n2 := range nodes {
+			if n1 == n2 {
+				continue
+			}
+			_, err := sn.net.LinkPeers(n1.ID(), n2.ID())
+			require.NoError(sn.t, err)
+
+			_, err = sn.net.ConnectPeers(n1.ID(), n2.ID())
+			require.NoError(sn.t, err)
+		}
+	}
 }
