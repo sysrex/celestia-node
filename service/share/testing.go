@@ -119,6 +119,7 @@ func (dn *dagNet) Node() *node {
 		bitswap.EngineBlockstoreWorkerCount(1), // otherwise it spawns 128 routines which is too much for tests
 		bitswap.EngineTaskWorkerCount(2),
 		bitswap.TaskWorkerCount(2),
+		bitswap.SetSimulateDontHavesOnTimeout(false),
 	)
 	nd := &node{DAGService: merkledag.NewDAGService(blockservice.New(bstore, bs)), Host: hst}
 	dn.nodes = append(dn.nodes, nd)
